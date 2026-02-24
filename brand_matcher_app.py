@@ -1,9 +1,8 @@
 """
 Brand Name Matcher - Streamlit App
 ===================================
-Deploy to Streamlit Cloud or run locally:
-    pip install streamlit pandas openpyxl rapidfuzz
-    streamlit run brand_matcher_app.py
+Searches Brand Core AND Subsidiary (Adintel), Advertiser AND Brand Leaf (Pathmatics).
+Shows paired columns so users see the full brand hierarchy.
 """
 
 import streamlit as st
@@ -72,25 +71,56 @@ def composite_score(q, c):
         if not (qt <= ct) and not (ct <= qt): base = min(base, 94)
     return base
 
-def find_top_matches(query, norm_strings, originals, categories, top_n=3):
+
+def find_best_in_paired(query, df_ref, col1_norm, col2_norm, col1_name, col2_name, cat_col):
+    """
+    Search BOTH columns of a paired reference. For each input query part,
+    search col1 and col2 independently, return the best match row.
+    """
     parts = extract_name_parts(query)
-    all_scored = {}
+    best_score = 0.0
+    best_row = None
+
     for part in parts:
         pn = normalize(part)
-        if not pn: continue
-        for i, ns in enumerate(norm_strings):
-            if ns == pn: all_scored[i] = (originals[i], 100.0, categories[i])
-        seen = set()
-        cands = []
-        for scorer in [fuzz.token_sort_ratio, fuzz.token_set_ratio, fuzz.partial_ratio]:
-            for ns, _, idx in process.extract(pn, norm_strings, scorer=scorer, limit=top_n*5):
-                if idx not in seen: seen.add(idx); cands.append((ns, idx))
-        for ns, idx in cands:
-            score = composite_score(pn, ns)
-            if idx not in all_scored or score > all_scored[idx][1]:
-                all_scored[idx] = (originals[idx], score, categories[idx])
-    ranked = sorted(all_scored.values(), key=lambda x: x[1], reverse=True)
-    return ranked[:top_n] if ranked else [("NO MATCH", 0.0, "")]
+        if not pn:
+            continue
+
+        # Search in both columns
+        for norm_list, col_name in [(col1_norm, col1_name), (col2_norm, col2_name)]:
+            # Exact match
+            for i, ns in enumerate(norm_list):
+                if ns == pn and 100.0 > best_score:
+                    best_score = 100.0
+                    best_row = df_ref.iloc[i]
+
+            # Fuzzy match
+            seen = set()
+            cands = []
+            for scorer in [fuzz.token_sort_ratio, fuzz.token_set_ratio, fuzz.partial_ratio]:
+                for ns, _, idx in process.extract(pn, norm_list, scorer=scorer, limit=TOP_N_MATCHES * 3):
+                    if idx not in seen:
+                        seen.add(idx)
+                        cands.append((ns, idx))
+
+            for ns, idx in cands:
+                sc = composite_score(pn, ns)
+                if sc > best_score:
+                    best_score = sc
+                    best_row = df_ref.iloc[idx]
+
+        if best_score >= 100:
+            break
+
+    if best_row is not None:
+        return {
+            "col1": str(best_row[col1_name]),
+            "col2": str(best_row[col2_name]),
+            "category": str(best_row[cat_col]) if cat_col in best_row.index else "",
+            "score": best_score,
+        }
+    return {"col1": "NO MATCH", "col2": "", "category": "", "score": 0.0}
+
 
 # ── Load Data ──
 @st.cache_data(show_spinner="Loading reference data...")
@@ -99,16 +129,20 @@ def load_reference_data():
     for d in [os.path.dirname(os.path.abspath(__file__)), os.getcwd(), "/mount/src/brand-name-matcher", "."]:
         ap, pp = os.path.join(d, ADINTEL_REF), os.path.join(d, PATHMATICS_REF)
         if os.path.exists(ap) and os.path.exists(pp):
-            ad_df = pd.read_csv(ap, compression="gzip")
-            pa_df = pd.read_csv(pp, compression="gzip")
-            ad_brands = ad_df["brand"].dropna().astype(str).tolist()
-            ad_cats = ad_df["category"].fillna("").astype(str).tolist() if "category" in ad_df.columns else [""]*len(ad_brands)
-            pa_brands = pa_df["brand"].dropna().astype(str).tolist()
-            pa_cats = pa_df["category"].fillna("").astype(str).tolist() if "category" in pa_df.columns else [""]*len(pa_brands)
-            ad_norm = [normalize(b) for b in ad_brands]
-            pa_norm = [normalize(b) for b in pa_brands]
-            return ad_norm, ad_brands, ad_cats, pa_norm, pa_brands, pa_cats, None
+            ad = pd.read_csv(ap, compression="gzip").fillna("")
+            pa = pd.read_csv(pp, compression="gzip").fillna("")
+
+            # Normalize both columns for Adintel
+            ad_col1_norm = [normalize(str(x)) for x in ad["Brand Core"]]
+            ad_col2_norm = [normalize(str(x)) for x in ad["Subsidiary"]]
+
+            # Normalize both columns for Pathmatics
+            pa_col1_norm = [normalize(str(x)) for x in pa["Advertiser"]]
+            pa_col2_norm = [normalize(str(x)) for x in pa["Brand Leaf"]]
+
+            return ad, ad_col1_norm, ad_col2_norm, pa, pa_col1_norm, pa_col2_norm, None
     return None, None, None, None, None, None, "Reference files not found. Run prepare_reference_data.py first."
+
 
 # ── UI ──
 def main():
@@ -116,21 +150,20 @@ def main():
     st.markdown("Match competitive brand names against **Adintel** and **Pathmatics** databases.")
     st.markdown("---")
 
-    data = load_reference_data()
-    ad_norm, ad_originals, ad_cats, pa_norm, pa_originals, pa_cats, error = data
+    ad, ad_c1n, ad_c2n, pa, pa_c1n, pa_c2n, error = load_reference_data()
     if error: st.error(error); st.stop()
 
-    st.success(f"✅ Reference data loaded: **{len(ad_originals):,}** Adintel brands | **{len(pa_originals):,}** Pathmatics brands")
+    st.success(f"✅ Loaded: **{len(ad):,}** Adintel pairs | **{len(pa):,}** Pathmatics pairs")
 
     st.subheader("📋 Enter Brand Names")
     st.markdown("Paste brand names below — **one per line**:")
     brand_input = st.text_area("Brand names", height=300,
-        placeholder="111skin\nAnywhere Real Estate\nLimeLife USA LLC\n...", label_visibility="collapsed")
+        placeholder="111skin\nLimeLife USA LLC\nCovetrus (SmartPak Equine)\n...", label_visibility="collapsed")
 
     col1, col2 = st.columns([1, 4])
-    with col1: run_button = st.button("🚀 Match Brands", type="primary", use_container_width=True)
+    with col1: run_btn = st.button("🚀 Match Brands", type="primary", use_container_width=True)
 
-    if run_button and brand_input.strip():
+    if run_btn and brand_input.strip():
         brands = [b.strip() for b in brand_input.strip().split('\n') if b.strip()]
         if not brands: st.warning("No brand names found."); st.stop()
 
@@ -138,103 +171,69 @@ def main():
         progress = st.progress(0, text="Matching brands...")
 
         for i, brand in enumerate(brands):
-            ad_top = find_top_matches(brand, ad_norm, ad_originals, ad_cats, top_n=3)
-            pa_top = find_top_matches(brand, pa_norm, pa_originals, pa_cats, top_n=3)
+            ad_res = find_best_in_paired(brand, ad, ad_c1n, ad_c2n, "Brand Core", "Subsidiary", "category")
+            pa_res = find_best_in_paired(brand, pa, pa_c1n, pa_c2n, "Advertiser", "Brand Leaf", "category")
 
-            ad_best, ad_score, ad_cat = ad_top[0]
-            pa_best, pa_score, pa_cat = pa_top[0]
+            ads, pas = ad_res["score"], pa_res["score"]
 
-            ad_alts = ""
-            if ad_score < MATCH_THRESHOLD and len(ad_top) > 1:
-                al = [f"{n} [{c}] ({s:.0f})" if c else f"{n} ({s:.0f})" for n,s,c in ad_top[1:] if s >= 50]
-                if al: ad_alts = " | ".join(al)
+            if ads >= MATCH_THRESHOLD: ad_status = "✅ Match"
+            elif ads >= SUGGEST_THRESHOLD: ad_status = "⚠️ Needs Review"
+            else: ad_status = "❌ Needs Review"
 
-            pa_alts = ""
-            if pa_score < MATCH_THRESHOLD and len(pa_top) > 1:
-                al = [f"{n} [{c}] ({s:.0f})" if c else f"{n} ({s:.0f})" for n,s,c in pa_top[1:] if s >= 50]
-                if al: pa_alts = " | ".join(al)
-
-            if ad_score >= MATCH_THRESHOLD: ad_display, ad_status = ad_best, "✅ Match"
-            elif ad_score >= SUGGEST_THRESHOLD: ad_display, ad_status = ad_best, "⚠️ Needs Review"
-            else: ad_display, ad_status = "—", "❌ Needs Review"
-
-            if pa_score >= MATCH_THRESHOLD: pa_display, pa_status = pa_best, "✅ Match"
-            elif pa_score >= SUGGEST_THRESHOLD: pa_display, pa_status = pa_best, "⚠️ Needs Review"
-            else: pa_display, pa_status = "—", "❌ Needs Review"
+            if pas >= MATCH_THRESHOLD: pa_status = "✅ Match"
+            elif pas >= SUGGEST_THRESHOLD: pa_status = "⚠️ Needs Review"
+            else: pa_status = "❌ Needs Review"
 
             results.append({
                 "Input Brand": brand,
-                "Adintel Match": ad_display, "Adintel Category": ad_cat if ad_score >= SUGGEST_THRESHOLD else "",
-                "Adintel Confidence": ad_status, "Adintel Score": round(ad_score), "Adintel Alternatives": ad_alts,
-                "Pathmatics Match": pa_display, "Pathmatics Category": pa_cat if pa_score >= SUGGEST_THRESHOLD else "",
-                "Pathmatics Confidence": pa_status, "Pathmatics Score": round(pa_score), "Pathmatics Alternatives": pa_alts,
+                "Ad Brand Core": ad_res["col1"] if ads >= SUGGEST_THRESHOLD else "—",
+                "Ad Subsidiary": ad_res["col2"] if ads >= SUGGEST_THRESHOLD else "—",
+                "Ad Category": ad_res["category"] if ads >= SUGGEST_THRESHOLD else "",
+                "Ad Confidence": ad_status,
+                "Ad Score": round(ads),
+                "Pa Advertiser": pa_res["col1"] if pas >= SUGGEST_THRESHOLD else "—",
+                "Pa Brand Leaf": pa_res["col2"] if pas >= SUGGEST_THRESHOLD else "—",
+                "Pa Category": pa_res["category"] if pas >= SUGGEST_THRESHOLD else "",
+                "Pa Confidence": pa_status,
+                "Pa Score": round(pas),
             })
             progress.progress((i+1)/len(brands), text=f"Matching {i+1}/{len(brands)}: {brand}")
 
         progress.empty()
         st.subheader(f"📊 Results ({len(results)} brands)")
-        df_results = pd.DataFrame(results)
+        df_r = pd.DataFrame(results)
 
         c1,c2,c3 = st.columns(3)
-        ad_m = sum(1 for r in results if r["Adintel Score"]>=MATCH_THRESHOLD)
-        pa_m = sum(1 for r in results if r["Pathmatics Score"]>=MATCH_THRESHOLD)
-        both = sum(1 for r in results if r["Adintel Score"]>=MATCH_THRESHOLD and r["Pathmatics Score"]>=MATCH_THRESHOLD)
-        c1.metric("Adintel Matches", f"{ad_m}/{len(results)}")
-        c2.metric("Pathmatics Matches", f"{pa_m}/{len(results)}")
-        c3.metric("Both Matched", f"{both}/{len(results)}")
+        am = sum(1 for r in results if r["Ad Score"]>=MATCH_THRESHOLD)
+        pm = sum(1 for r in results if r["Pa Score"]>=MATCH_THRESHOLD)
+        bm = sum(1 for r in results if r["Ad Score"]>=MATCH_THRESHOLD and r["Pa Score"]>=MATCH_THRESHOLD)
+        c1.metric("Adintel Matches", f"{am}/{len(results)}")
+        c2.metric("Pathmatics Matches", f"{pm}/{len(results)}")
+        c3.metric("Both Matched", f"{bm}/{len(results)}")
 
-        def hl(val):
-            if "✅" in str(val): return "background-color: #C6EFCE"
-            elif "⚠️" in str(val): return "background-color: #FFEB9C"
-            elif "❌" in str(val): return "background-color: #FFC7CE"
+        def hl(v):
+            if "✅" in str(v): return "background-color: #C6EFCE"
+            elif "⚠️" in str(v): return "background-color: #FFEB9C"
+            elif "❌" in str(v): return "background-color: #FFC7CE"
             return ""
 
-        main_cols = ["Input Brand", "Adintel Match", "Adintel Category", "Adintel Confidence",
-                     "Pathmatics Match", "Pathmatics Category", "Pathmatics Confidence"]
-        styled = df_results[main_cols].style.applymap(hl, subset=["Adintel Confidence", "Pathmatics Confidence"])
+        show_cols = ["Input Brand", "Ad Brand Core", "Ad Subsidiary", "Ad Category", "Ad Confidence",
+                     "Pa Advertiser", "Pa Brand Leaf", "Pa Category", "Pa Confidence"]
+        styled = df_r[show_cols].style.applymap(hl, subset=["Ad Confidence", "Pa Confidence"])
         st.dataframe(styled, use_container_width=True, height=min(len(results)*40+50, 600))
-
-        # Needs Review section
-        needs_review = [r for r in results if r["Adintel Score"]<MATCH_THRESHOLD or r["Pathmatics Score"]<MATCH_THRESHOLD]
-        if needs_review:
-            st.markdown("---")
-            st.subheader("🔎 Needs Review — Alternative Suggestions")
-            for r in needs_review:
-                with st.expander(f"**{r['Input Brand']}**"):
-                    ca, cp = st.columns(2)
-                    with ca:
-                        st.markdown("**Adintel**")
-                        if r["Adintel Score"] >= MATCH_THRESHOLD:
-                            st.markdown(f"✅ {r['Adintel Match']} — *{r['Adintel Category']}*")
-                        else:
-                            nm = r["Adintel Match"] if r["Adintel Match"]!="—" else "No close match"
-                            cat_str = f" — *{r['Adintel Category']}*" if r["Adintel Category"] else ""
-                            st.markdown(f"Best guess: **{nm}**{cat_str} (score: {r['Adintel Score']})")
-                            if r["Adintel Alternatives"]: st.markdown(f"Other options: {r['Adintel Alternatives']}")
-                    with cp:
-                        st.markdown("**Pathmatics**")
-                        if r["Pathmatics Score"] >= MATCH_THRESHOLD:
-                            st.markdown(f"✅ {r['Pathmatics Match']} — *{r['Pathmatics Category']}*")
-                        else:
-                            nm = r["Pathmatics Match"] if r["Pathmatics Match"]!="—" else "No close match"
-                            cat_str = f" — *{r['Pathmatics Category']}*" if r["Pathmatics Category"] else ""
-                            st.markdown(f"Best guess: **{nm}**{cat_str} (score: {r['Pathmatics Score']})")
-                            if r["Pathmatics Alternatives"]: st.markdown(f"Other options: {r['Pathmatics Alternatives']}")
 
         # Download
         st.markdown("---")
-        dl_cols = ["Input Brand", "Adintel Match", "Adintel Category", "Adintel Confidence", "Adintel Alternatives",
-                   "Pathmatics Match", "Pathmatics Category", "Pathmatics Confidence", "Pathmatics Alternatives"]
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as w:
-            df_results[dl_cols].to_excel(w, index=False, sheet_name='Brand Match Results')
+            df_r[show_cols].to_excel(w, index=False, sheet_name='Brand Match Results')
         output.seek(0)
         ts = datetime.now().strftime("%Y%m%d_%H%M")
         st.download_button("📥 Download Results (Excel)", data=output,
             file_name=f"brand_match_results_{ts}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
 
-    elif run_button:
+    elif run_btn:
         st.warning("Please enter brand names first.")
 
 if __name__ == "__main__":
