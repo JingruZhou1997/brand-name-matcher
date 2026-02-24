@@ -28,8 +28,8 @@ TOP_N_MATCHES = 3
 MATCH_THRESHOLD = 95
 SUGGEST_THRESHOLD = 90
 
-ADINTEL_REF = "adintel_brands.csv"
-PATHMATICS_REF = "pathmatics_brands.csv"
+ADINTEL_REF = "adintel_brands.csv.gz"
+PATHMATICS_REF = "pathmatics_brands.csv.gz"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -152,16 +152,31 @@ def find_best_match(query, norm_strings, originals):
 @st.cache_data(show_spinner="Loading reference data...")
 def load_reference_data():
     import os
-    script_dir = os.path.dirname(os.path.abspath(__file__))
 
-    ad_path = os.path.join(script_dir, ADINTEL_REF)
-    pa_path = os.path.join(script_dir, PATHMATICS_REF)
+    # Try multiple locations where the files might be
+    possible_dirs = [
+        os.path.dirname(os.path.abspath(__file__)),         # same folder as script
+        os.getcwd(),                                         # current working directory
+        "/mount/src/brand-name-matcher",                     # Streamlit Cloud default
+        ".",                                                  # relative
+    ]
 
-    if not os.path.exists(ad_path) or not os.path.exists(pa_path):
-        return None, None, None, None, f"Reference files not found in {script_dir}. Run prepare_reference_data.py first."
+    ad_path = None
+    pa_path = None
+    for d in possible_dirs:
+        ap = os.path.join(d, ADINTEL_REF)
+        pp = os.path.join(d, PATHMATICS_REF)
+        if os.path.exists(ap) and ad_path is None:
+            ad_path = ap
+        if os.path.exists(pp) and pa_path is None:
+            pa_path = pp
 
-    ad_df = pd.read_csv(ad_path)
-    pa_df = pd.read_csv(pa_path)
+    if not ad_path or not pa_path:
+        searched = ", ".join(possible_dirs)
+        return None, None, None, None, f"Reference files not found. Searched: {searched}. Run prepare_reference_data.py first."
+
+    ad_df = pd.read_csv(ad_path, compression="gzip")
+    pa_df = pd.read_csv(pa_path, compression="gzip")
 
     ad_brands = ad_df.iloc[:, 0].dropna().unique().tolist()
     pa_brands = pa_df.iloc[:, 0].dropna().unique().tolist()
