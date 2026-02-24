@@ -1,8 +1,8 @@
 """
-Brand Name Matcher - Streamlit App
-===================================
-Searches Brand Core AND Subsidiary (Adintel), Advertiser AND Brand Leaf (Pathmatics).
-Shows paired columns so users see the full brand hierarchy.
+Brand Name Matcher - Streamlit App (Optimized)
+================================================
+Fast: builds deduplicated index once, uses dict for exact match,
+runs fuzzy search on small deduped list, maps back to paired rows.
 """
 
 import streamlit as st
@@ -58,7 +58,6 @@ def extract_name_parts(brand):
             if c.strip() and c.strip() != brand.strip() and len(c.strip()) > 2: parts.append(c.strip())
     return parts
 
-# ── Scoring ──
 def composite_score(q, c):
     base = fuzz.token_sort_ratio(q,c)*0.30 + fuzz.token_set_ratio(q,c)*0.30 + fuzz.partial_ratio(q,c)*0.20 + fuzz.ratio(q,c)*0.20
     qt, ct = set(q.split()), set(c.split())
@@ -72,54 +71,88 @@ def composite_score(q, c):
     return base
 
 
-def find_best_in_paired(query, df_ref, col1_norm, col2_norm, col1_name, col2_name, cat_col):
+class FastPairedMatcher:
     """
-    Search BOTH columns of a paired reference. For each input query part,
-    search col1 and col2 independently, return the best match row.
+    Speed optimizations vs old version:
+    1. Merges both columns into ONE deduplicated normalized list (e.g. 240K pairs → ~400K unique names)
+    2. Dict lookup for exact match = O(1) instead of O(n) linear scan
+    3. rapidfuzz.process.extract runs on the smaller deduped list, not raw paired data
+    4. Maps match back to original paired row for display
     """
-    parts = extract_name_parts(query)
-    best_score = 0.0
-    best_row = None
+    def __init__(self, df, col1, col2, cat_col):
+        self.df = df
+        self.col1 = col1
+        self.col2 = col2
+        self.cat_col = cat_col
 
-    for part in parts:
-        pn = normalize(part)
-        if not pn:
-            continue
+        # Vectorized normalization (no iterrows)
+        c1_norms = [normalize(str(v)) for v in df[col1].tolist()]
+        c2_norms = [normalize(str(v)) for v in df[col2].tolist()]
 
-        # Search in both columns
-        for norm_list, col_name in [(col1_norm, col1_name), (col2_norm, col2_name)]:
-            # Exact match
-            for i, ns in enumerate(norm_list):
-                if ns == pn and 100.0 > best_score:
-                    best_score = 100.0
-                    best_row = df_ref.iloc[i]
+        # Build deduped index: norm_string -> first row index
+        # Priority: col1 first, then col2 (so Brand Core / Advertiser preferred)
+        norm_to_row = {}
+        for i, n in enumerate(c1_norms):
+            if n and n not in norm_to_row:
+                norm_to_row[n] = i
+        for i, n in enumerate(c2_norms):
+            if n and n not in norm_to_row:
+                norm_to_row[n] = i
 
-            # Fuzzy match
+        # Parallel arrays for rapidfuzz
+        self.norm_strings = list(norm_to_row.keys())
+        self.norm_to_row_idx = list(norm_to_row.values())
+
+        # Dict for O(1) exact match
+        self.exact_lookup = norm_to_row
+
+    def find_best(self, query):
+        parts = extract_name_parts(query)
+        best_score = 0.0
+        best_row_idx = None
+
+        for part in parts:
+            pn = normalize(part)
+            if not pn:
+                continue
+
+            # O(1) exact match check
+            if pn in self.exact_lookup:
+                return self._make_result(self.exact_lookup[pn], 100.0)
+
+            # Fuzzy search on deduped list only
             seen = set()
             cands = []
             for scorer in [fuzz.token_sort_ratio, fuzz.token_set_ratio, fuzz.partial_ratio]:
-                for ns, _, idx in process.extract(pn, norm_list, scorer=scorer, limit=TOP_N_MATCHES * 3):
-                    if idx not in seen:
-                        seen.add(idx)
-                        cands.append((ns, idx))
+                results = process.extract(pn, self.norm_strings, scorer=scorer,
+                                          limit=TOP_N_MATCHES * 3, score_cutoff=60)
+                if results:
+                    for ns, _, idx in results:
+                        if idx not in seen:
+                            seen.add(idx)
+                            cands.append((ns, idx))
 
             for ns, idx in cands:
-                sc = composite_score(pn, ns)
+                sc = composite_score(pn, self.norm_strings[idx])
                 if sc > best_score:
                     best_score = sc
-                    best_row = df_ref.iloc[idx]
+                    best_row_idx = self.norm_to_row_idx[idx]
 
-        if best_score >= 100:
-            break
+            if best_score >= 100:
+                break
 
-    if best_row is not None:
+        if best_row_idx is not None:
+            return self._make_result(best_row_idx, best_score)
+        return {"col1": "NO MATCH", "col2": "", "category": "", "score": 0.0}
+
+    def _make_result(self, row_idx, score):
+        row = self.df.iloc[row_idx]
         return {
-            "col1": str(best_row[col1_name]),
-            "col2": str(best_row[col2_name]),
-            "category": str(best_row[cat_col]) if cat_col in best_row.index else "",
-            "score": best_score,
+            "col1": str(row[self.col1]),
+            "col2": str(row[self.col2]),
+            "category": str(row.get(self.cat_col, "")),
+            "score": score,
         }
-    return {"col1": "NO MATCH", "col2": "", "category": "", "score": 0.0}
 
 
 # ── Load Data ──
@@ -131,17 +164,15 @@ def load_reference_data():
         if os.path.exists(ap) and os.path.exists(pp):
             ad = pd.read_csv(ap, compression="gzip").fillna("")
             pa = pd.read_csv(pp, compression="gzip").fillna("")
+            return ad, pa, None
+    return None, None, "Reference files not found. Run prepare_reference_data.py first."
 
-            # Normalize both columns for Adintel
-            ad_col1_norm = [normalize(str(x)) for x in ad["Brand Core"]]
-            ad_col2_norm = [normalize(str(x)) for x in ad["Subsidiary"]]
 
-            # Normalize both columns for Pathmatics
-            pa_col1_norm = [normalize(str(x)) for x in pa["Advertiser"]]
-            pa_col2_norm = [normalize(str(x)) for x in pa["Brand Leaf"]]
-
-            return ad, ad_col1_norm, ad_col2_norm, pa, pa_col1_norm, pa_col2_norm, None
-    return None, None, None, None, None, None, "Reference files not found. Run prepare_reference_data.py first."
+@st.cache_resource(show_spinner="Building search index (one-time)...")
+def build_matchers(_ad, _pa):
+    ad_matcher = FastPairedMatcher(_ad, "Brand Core", "Subsidiary", "category")
+    pa_matcher = FastPairedMatcher(_pa, "Advertiser", "Brand Leaf", "category")
+    return ad_matcher, pa_matcher
 
 
 # ── UI ──
@@ -150,10 +181,12 @@ def main():
     st.markdown("Match competitive brand names against **Adintel** and **Pathmatics** databases.")
     st.markdown("---")
 
-    ad, ad_c1n, ad_c2n, pa, pa_c1n, pa_c2n, error = load_reference_data()
+    ad_df, pa_df, error = load_reference_data()
     if error: st.error(error); st.stop()
 
-    st.success(f"✅ Loaded: **{len(ad):,}** Adintel pairs | **{len(pa):,}** Pathmatics pairs")
+    ad_matcher, pa_matcher = build_matchers(ad_df, pa_df)
+
+    st.success(f"✅ Loaded: **{len(ad_df):,}** Adintel pairs ({len(ad_matcher.norm_strings):,} unique names) | **{len(pa_df):,}** Pathmatics pairs ({len(pa_matcher.norm_strings):,} unique names)")
 
     st.subheader("📋 Enter Brand Names")
     st.markdown("Paste brand names below — **one per line**:")
@@ -171,9 +204,8 @@ def main():
         progress = st.progress(0, text="Matching brands...")
 
         for i, brand in enumerate(brands):
-            ad_res = find_best_in_paired(brand, ad, ad_c1n, ad_c2n, "Brand Core", "Subsidiary", "category")
-            pa_res = find_best_in_paired(brand, pa, pa_c1n, pa_c2n, "Advertiser", "Brand Leaf", "category")
-
+            ad_res = ad_matcher.find_best(brand)
+            pa_res = pa_matcher.find_best(brand)
             ads, pas = ad_res["score"], pa_res["score"]
 
             if ads >= MATCH_THRESHOLD: ad_status = "✅ Match"
@@ -189,13 +221,11 @@ def main():
                 "Ad Brand Core": ad_res["col1"] if ads >= SUGGEST_THRESHOLD else "—",
                 "Ad Subsidiary": ad_res["col2"] if ads >= SUGGEST_THRESHOLD else "—",
                 "Ad Category": ad_res["category"] if ads >= SUGGEST_THRESHOLD else "",
-                "Ad Confidence": ad_status,
-                "Ad Score": round(ads),
+                "Ad Confidence": ad_status, "Ad Score": round(ads),
                 "Pa Advertiser": pa_res["col1"] if pas >= SUGGEST_THRESHOLD else "—",
                 "Pa Brand Leaf": pa_res["col2"] if pas >= SUGGEST_THRESHOLD else "—",
                 "Pa Category": pa_res["category"] if pas >= SUGGEST_THRESHOLD else "",
-                "Pa Confidence": pa_status,
-                "Pa Score": round(pas),
+                "Pa Confidence": pa_status, "Pa Score": round(pas),
             })
             progress.progress((i+1)/len(brands), text=f"Matching {i+1}/{len(brands)}: {brand}")
 
@@ -222,7 +252,6 @@ def main():
         styled = df_r[show_cols].style.applymap(hl, subset=["Ad Confidence", "Pa Confidence"])
         st.dataframe(styled, use_container_width=True, height=min(len(results)*40+50, 600))
 
-        # Download
         st.markdown("---")
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as w:
