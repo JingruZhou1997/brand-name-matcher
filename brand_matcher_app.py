@@ -1,8 +1,8 @@
 """
 Brand Name Matcher - Streamlit App (Optimized)
 ================================================
-Fast: builds deduplicated index once, uses dict for exact match,
-runs fuzzy search on small deduped list, maps back to paired rows.
+Matches against Adintel, Pathmatics, and Media Radar.
+Fast: deduplicated index, dict exact match, single fuzzy search per source.
 """
 
 import streamlit as st
@@ -19,6 +19,7 @@ MATCH_THRESHOLD = 95
 SUGGEST_THRESHOLD = 90
 ADINTEL_REF = "adintel_brands.csv.gz"
 PATHMATICS_REF = "pathmatics_brands.csv.gz"
+MEDIARADAR_REF = "mediaradar_brands.csv.gz"
 
 # ── Normalization ──
 STRIP_SUFFIXES = (
@@ -73,11 +74,8 @@ def composite_score(q, c):
 
 class FastPairedMatcher:
     """
-    Speed optimizations vs old version:
-    1. Merges both columns into ONE deduplicated normalized list (e.g. 240K pairs → ~400K unique names)
-    2. Dict lookup for exact match = O(1) instead of O(n) linear scan
-    3. rapidfuzz.process.extract runs on the smaller deduped list, not raw paired data
-    4. Maps match back to original paired row for display
+    Fast matching: deduplicates normalized names from both columns into one
+    searchable list. Maps matches back to paired rows.
     """
     def __init__(self, df, col1, col2, cat_col):
         self.df = df
@@ -85,12 +83,9 @@ class FastPairedMatcher:
         self.col2 = col2
         self.cat_col = cat_col
 
-        # Vectorized normalization (no iterrows)
         c1_norms = [normalize(str(v)) for v in df[col1].tolist()]
         c2_norms = [normalize(str(v)) for v in df[col2].tolist()]
 
-        # Build deduped index: norm_string -> first row index
-        # Priority: col1 first, then col2 (so Brand Core / Advertiser preferred)
         norm_to_row = {}
         for i, n in enumerate(c1_norms):
             if n and n not in norm_to_row:
@@ -99,11 +94,8 @@ class FastPairedMatcher:
             if n and n not in norm_to_row:
                 norm_to_row[n] = i
 
-        # Parallel arrays for rapidfuzz
         self.norm_strings = list(norm_to_row.keys())
         self.norm_to_row_idx = list(norm_to_row.values())
-
-        # Dict for O(1) exact match
         self.exact_lookup = norm_to_row
 
     def find_best(self, query):
@@ -116,11 +108,9 @@ class FastPairedMatcher:
             if not pn:
                 continue
 
-            # O(1) exact match check
             if pn in self.exact_lookup:
                 return self._make_result(self.exact_lookup[pn], 100.0)
 
-            # Fuzzy search on deduped list only
             seen = set()
             cands = []
             for scorer in [fuzz.token_sort_ratio, fuzz.token_set_ratio, fuzz.partial_ratio]:
@@ -160,33 +150,41 @@ class FastPairedMatcher:
 def load_reference_data():
     import os
     for d in [os.path.dirname(os.path.abspath(__file__)), os.getcwd(), "/mount/src/brand-name-matcher", "."]:
-        ap, pp = os.path.join(d, ADINTEL_REF), os.path.join(d, PATHMATICS_REF)
-        if os.path.exists(ap) and os.path.exists(pp):
+        ap = os.path.join(d, ADINTEL_REF)
+        pp = os.path.join(d, PATHMATICS_REF)
+        mp = os.path.join(d, MEDIARADAR_REF)
+        if os.path.exists(ap) and os.path.exists(pp) and os.path.exists(mp):
             ad = pd.read_csv(ap, compression="gzip").fillna("")
             pa = pd.read_csv(pp, compression="gzip").fillna("")
-            return ad, pa, None
-    return None, None, "Reference files not found. Run prepare_reference_data.py first."
+            mr = pd.read_csv(mp, compression="gzip").fillna("")
+            return ad, pa, mr, None
+    return None, None, None, "Reference files not found. Run prepare_reference_data.py first."
 
 
 @st.cache_resource(show_spinner="Building search index (one-time)...")
-def build_matchers(_ad, _pa):
+def build_matchers(_ad, _pa, _mr):
     ad_matcher = FastPairedMatcher(_ad, "Brand Core", "Subsidiary", "category")
     pa_matcher = FastPairedMatcher(_pa, "Advertiser", "Brand Leaf", "category")
-    return ad_matcher, pa_matcher
+    mr_matcher = FastPairedMatcher(_mr, "Parent", "Product Line", "category")
+    return ad_matcher, pa_matcher, mr_matcher
 
 
 # ── UI ──
 def main():
     st.title("🔍 Brand Name Matcher")
-    st.markdown("Match competitive brand names against **Adintel** and **Pathmatics** databases.")
+    st.markdown("Match competitive brand names against **Adintel**, **Pathmatics**, and **Media Radar** databases.")
     st.markdown("---")
 
-    ad_df, pa_df, error = load_reference_data()
+    ad_df, pa_df, mr_df, error = load_reference_data()
     if error: st.error(error); st.stop()
 
-    ad_matcher, pa_matcher = build_matchers(ad_df, pa_df)
+    ad_matcher, pa_matcher, mr_matcher = build_matchers(ad_df, pa_df, mr_df)
 
-    st.success(f"✅ Loaded: **{len(ad_df):,}** Adintel pairs ({len(ad_matcher.norm_strings):,} unique names) | **{len(pa_df):,}** Pathmatics pairs ({len(pa_matcher.norm_strings):,} unique names)")
+    st.success(
+        f"✅ Loaded: **{len(ad_df):,}** Adintel pairs ({len(ad_matcher.norm_strings):,} unique) | "
+        f"**{len(pa_df):,}** Pathmatics pairs ({len(pa_matcher.norm_strings):,} unique) | "
+        f"**{len(mr_df):,}** Media Radar pairs ({len(mr_matcher.norm_strings):,} unique)"
+    )
 
     st.subheader("📋 Enter Brand Names")
     st.markdown("Paste brand names below — **one per line**:")
@@ -206,26 +204,34 @@ def main():
         for i, brand in enumerate(brands):
             ad_res = ad_matcher.find_best(brand)
             pa_res = pa_matcher.find_best(brand)
-            ads, pas = ad_res["score"], pa_res["score"]
+            mr_res = mr_matcher.find_best(brand)
+            ads, pas, mrs = ad_res["score"], pa_res["score"], mr_res["score"]
 
-            if ads >= MATCH_THRESHOLD: ad_status = "✅ Match"
-            elif ads >= SUGGEST_THRESHOLD: ad_status = "⚠️ Needs Review"
-            else: ad_status = "❌ Needs Review"
+            def status(score):
+                if score >= MATCH_THRESHOLD: return "✅ Match"
+                elif score >= SUGGEST_THRESHOLD: return "⚠️ Needs Review"
+                else: return "❌ Needs Review"
 
-            if pas >= MATCH_THRESHOLD: pa_status = "✅ Match"
-            elif pas >= SUGGEST_THRESHOLD: pa_status = "⚠️ Needs Review"
-            else: pa_status = "❌ Needs Review"
+            def val_or_dash(res, key, score):
+                return res[key] if score >= SUGGEST_THRESHOLD else "—"
+
+            def cat_or_empty(res, score):
+                return res["category"] if score >= SUGGEST_THRESHOLD else ""
 
             results.append({
                 "Input Brand": brand,
-                "Ad Brand Core": ad_res["col1"] if ads >= SUGGEST_THRESHOLD else "—",
-                "Ad Subsidiary": ad_res["col2"] if ads >= SUGGEST_THRESHOLD else "—",
-                "Ad Category": ad_res["category"] if ads >= SUGGEST_THRESHOLD else "",
-                "Ad Confidence": ad_status, "Ad Score": round(ads),
-                "Pa Advertiser": pa_res["col1"] if pas >= SUGGEST_THRESHOLD else "—",
-                "Pa Brand Leaf": pa_res["col2"] if pas >= SUGGEST_THRESHOLD else "—",
-                "Pa Category": pa_res["category"] if pas >= SUGGEST_THRESHOLD else "",
-                "Pa Confidence": pa_status, "Pa Score": round(pas),
+                "Ad Brand Core": val_or_dash(ad_res, "col1", ads),
+                "Ad Subsidiary": val_or_dash(ad_res, "col2", ads),
+                "Ad Category": cat_or_empty(ad_res, ads),
+                "Ad Confidence": status(ads), "Ad Score": round(ads),
+                "Pa Advertiser": val_or_dash(pa_res, "col1", pas),
+                "Pa Brand Leaf": val_or_dash(pa_res, "col2", pas),
+                "Pa Category": cat_or_empty(pa_res, pas),
+                "Pa Confidence": status(pas), "Pa Score": round(pas),
+                "MR Parent": val_or_dash(mr_res, "col1", mrs),
+                "MR Product Line": val_or_dash(mr_res, "col2", mrs),
+                "MR Category": cat_or_empty(mr_res, mrs),
+                "MR Confidence": status(mrs), "MR Score": round(mrs),
             })
             progress.progress((i+1)/len(brands), text=f"Matching {i+1}/{len(brands)}: {brand}")
 
@@ -233,13 +239,15 @@ def main():
         st.subheader(f"📊 Results ({len(results)} brands)")
         df_r = pd.DataFrame(results)
 
-        c1,c2,c3 = st.columns(3)
+        c1,c2,c3,c4 = st.columns(4)
         am = sum(1 for r in results if r["Ad Score"]>=MATCH_THRESHOLD)
         pm = sum(1 for r in results if r["Pa Score"]>=MATCH_THRESHOLD)
-        bm = sum(1 for r in results if r["Ad Score"]>=MATCH_THRESHOLD and r["Pa Score"]>=MATCH_THRESHOLD)
+        mm = sum(1 for r in results if r["MR Score"]>=MATCH_THRESHOLD)
+        allm = sum(1 for r in results if r["Ad Score"]>=MATCH_THRESHOLD and r["Pa Score"]>=MATCH_THRESHOLD and r["MR Score"]>=MATCH_THRESHOLD)
         c1.metric("Adintel Matches", f"{am}/{len(results)}")
         c2.metric("Pathmatics Matches", f"{pm}/{len(results)}")
-        c3.metric("Both Matched", f"{bm}/{len(results)}")
+        c3.metric("Media Radar Matches", f"{mm}/{len(results)}")
+        c4.metric("All Three Matched", f"{allm}/{len(results)}")
 
         def hl(v):
             if "✅" in str(v): return "background-color: #C6EFCE"
@@ -247,9 +255,11 @@ def main():
             elif "❌" in str(v): return "background-color: #FFC7CE"
             return ""
 
-        show_cols = ["Input Brand", "Ad Brand Core", "Ad Subsidiary", "Ad Category", "Ad Confidence",
-                     "Pa Advertiser", "Pa Brand Leaf", "Pa Category", "Pa Confidence"]
-        styled = df_r[show_cols].style.applymap(hl, subset=["Ad Confidence", "Pa Confidence"])
+        show_cols = ["Input Brand",
+                     "Ad Brand Core", "Ad Subsidiary", "Ad Category", "Ad Confidence",
+                     "Pa Advertiser", "Pa Brand Leaf", "Pa Category", "Pa Confidence",
+                     "MR Parent", "MR Product Line", "MR Category", "MR Confidence"]
+        styled = df_r[show_cols].style.applymap(hl, subset=["Ad Confidence", "Pa Confidence", "MR Confidence"])
         st.dataframe(styled, use_container_width=True, height=min(len(results)*40+50, 600))
 
         st.markdown("---")
