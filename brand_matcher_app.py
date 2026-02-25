@@ -1,14 +1,15 @@
 """
-Brand Name Matcher - Streamlit App (Optimized)
-================================================
+Brand Name Matcher - Streamlit App
+====================================
 Matches against Adintel, Pathmatics, and Media Radar.
-Fast: deduplicated index, dict exact match, single fuzzy search per source.
 """
 
 import streamlit as st
 import pandas as pd
 import re
 import io
+import os
+import gc
 from rapidfuzz import fuzz, process
 from datetime import datetime
 
@@ -74,17 +75,19 @@ def composite_score(q, c):
 
 class FastPairedMatcher:
     """
-    Fast matching: deduplicates normalized names from both columns into one
-    searchable list. Maps matches back to paired rows.
+    Memory-efficient matching: stores only the deduped norm strings,
+    row indices, and the original DataFrame columns needed for results.
     """
     def __init__(self, df, col1, col2, cat_col):
-        self.df = df
+        # Store only the 3 columns we need (not full DataFrame)
+        self.col1_vals = df[col1].astype(str).tolist()
+        self.col2_vals = df[col2].astype(str).tolist()
+        self.cat_vals = df[cat_col].astype(str).tolist() if cat_col in df.columns else [""] * len(df)
         self.col1 = col1
         self.col2 = col2
-        self.cat_col = cat_col
 
-        c1_norms = [normalize(str(v)) for v in df[col1].tolist()]
-        c2_norms = [normalize(str(v)) for v in df[col2].tolist()]
+        c1_norms = [normalize(v) for v in self.col1_vals]
+        c2_norms = [normalize(v) for v in self.col2_vals]
 
         norm_to_row = {}
         for i, n in enumerate(c1_norms):
@@ -97,6 +100,7 @@ class FastPairedMatcher:
         self.norm_strings = list(norm_to_row.keys())
         self.norm_to_row_idx = list(norm_to_row.values())
         self.exact_lookup = norm_to_row
+        self.n_pairs = len(df)
 
     def find_best(self, query):
         parts = extract_name_parts(query)
@@ -136,55 +140,90 @@ class FastPairedMatcher:
         return {"col1": "NO MATCH", "col2": "", "category": "", "score": 0.0}
 
     def _make_result(self, row_idx, score):
-        row = self.df.iloc[row_idx]
         return {
-            "col1": str(row[self.col1]),
-            "col2": str(row[self.col2]),
-            "category": str(row.get(self.cat_col, "")),
+            "col1": self.col1_vals[row_idx],
+            "col2": self.col2_vals[row_idx],
+            "category": self.cat_vals[row_idx],
             "score": score,
         }
 
 
-# ── Load Data ──
-@st.cache_data(show_spinner="Loading reference data...")
-def load_reference_data():
-    import os
-    for d in [os.path.dirname(os.path.abspath(__file__)), os.getcwd(), "/mount/src/brand-name-matcher", "."]:
-        ap = os.path.join(d, ADINTEL_REF)
-        pp = os.path.join(d, PATHMATICS_REF)
-        mp = os.path.join(d, MEDIARADAR_REF)
-        if os.path.exists(ap) and os.path.exists(pp) and os.path.exists(mp):
-            ad = pd.read_csv(ap, compression="gzip").fillna("")
-            pa = pd.read_csv(pp, compression="gzip").fillna("")
-            mr = pd.read_csv(mp, compression="gzip").fillna("")
-            return ad, pa, mr, None
-    return None, None, None, "Reference files not found. Run prepare_reference_data.py first."
+def find_file(filename):
+    for d in [os.path.dirname(os.path.abspath(__file__)), os.getcwd(),
+              "/mount/src/brand-name-matcher", "."]:
+        p = os.path.join(d, filename)
+        if os.path.exists(p):
+            return p
+    return None
 
 
-@st.cache_resource(show_spinner="Building search index (one-time)...")
-def build_matchers(_ad, _pa, _mr):
-    ad_matcher = FastPairedMatcher(_ad, "Brand Core", "Subsidiary", "category")
-    pa_matcher = FastPairedMatcher(_pa, "Advertiser", "Brand Leaf", "category")
-    mr_matcher = FastPairedMatcher(_mr, "Parent", "Product Line", "category")
-    return ad_matcher, pa_matcher, mr_matcher
+NO_MATCH = {"col1": "", "col2": "", "category": "", "score": 0.0}
 
 
-# ── UI ──
+@st.cache_resource(show_spinner="Loading and indexing reference data...")
+def load_and_build():
+    matchers = {}
+
+    # Adintel
+    ap = find_file(ADINTEL_REF)
+    if ap:
+        try:
+            df = pd.read_csv(ap, compression="gzip").fillna("")
+            matchers["ad"] = FastPairedMatcher(df, "Brand Core", "Subsidiary", "category")
+            del df; gc.collect()
+        except Exception as e:
+            print(f"Error loading Adintel: {e}")
+
+    # Pathmatics
+    pp = find_file(PATHMATICS_REF)
+    if pp:
+        try:
+            df = pd.read_csv(pp, compression="gzip").fillna("")
+            matchers["pa"] = FastPairedMatcher(df, "Advertiser", "Brand Leaf", "category")
+            del df; gc.collect()
+        except Exception as e:
+            print(f"Error loading Pathmatics: {e}")
+
+    # Media Radar
+    mp = find_file(MEDIARADAR_REF)
+    if mp:
+        try:
+            df = pd.read_csv(mp, compression="gzip").fillna("")
+            matchers["mr"] = FastPairedMatcher(df, "Parent", "Product Line", "category")
+            del df; gc.collect()
+        except Exception as e:
+            print(f"Error loading Media Radar: {e}")
+
+    return matchers
+
+
 def main():
     st.title("🔍 Brand Name Matcher")
     st.markdown("Match competitive brand names against **Adintel**, **Pathmatics**, and **Media Radar** databases.")
     st.markdown("---")
 
-    ad_df, pa_df, mr_df, error = load_reference_data()
-    if error: st.error(error); st.stop()
+    matchers = load_and_build()
 
-    ad_matcher, pa_matcher, mr_matcher = build_matchers(ad_df, pa_df, mr_df)
+    if not matchers:
+        st.error("No reference files found. Run prepare_reference_data.py first.")
+        st.stop()
 
-    st.success(
-        f"✅ Loaded: **{len(ad_df):,}** Adintel pairs ({len(ad_matcher.norm_strings):,} unique) | "
-        f"**{len(pa_df):,}** Pathmatics pairs ({len(pa_matcher.norm_strings):,} unique) | "
-        f"**{len(mr_df):,}** Media Radar pairs ({len(mr_matcher.norm_strings):,} unique)"
-    )
+    # Status
+    parts = []
+    if "ad" in matchers:
+        m = matchers["ad"]
+        parts.append(f"**{m.n_pairs:,}** Adintel ({len(m.norm_strings):,} unique)")
+    if "pa" in matchers:
+        m = matchers["pa"]
+        parts.append(f"**{m.n_pairs:,}** Pathmatics ({len(m.norm_strings):,} unique)")
+    if "mr" in matchers:
+        m = matchers["mr"]
+        parts.append(f"**{m.n_pairs:,}** Media Radar ({len(m.norm_strings):,} unique)")
+    st.success("✅ Loaded: " + " | ".join(parts))
+
+    missing = [n for k, n in [("ad","Adintel"),("pa","Pathmatics"),("mr","Media Radar")] if k not in matchers]
+    if missing:
+        st.warning(f"⚠️ Missing: {', '.join(missing)} — those columns will show '—'")
 
     st.subheader("📋 Enter Brand Names")
     st.markdown("Paste brand names below — **one per line**:")
@@ -202,9 +241,9 @@ def main():
         progress = st.progress(0, text="Matching brands...")
 
         for i, brand in enumerate(brands):
-            ad_res = ad_matcher.find_best(brand)
-            pa_res = pa_matcher.find_best(brand)
-            mr_res = mr_matcher.find_best(brand)
+            ad_res = matchers["ad"].find_best(brand) if "ad" in matchers else NO_MATCH
+            pa_res = matchers["pa"].find_best(brand) if "pa" in matchers else NO_MATCH
+            mr_res = matchers["mr"].find_best(brand) if "mr" in matchers else NO_MATCH
             ads, pas, mrs = ad_res["score"], pa_res["score"], mr_res["score"]
 
             def status(score):
@@ -239,15 +278,16 @@ def main():
         st.subheader(f"📊 Results ({len(results)} brands)")
         df_r = pd.DataFrame(results)
 
-        c1,c2,c3,c4 = st.columns(4)
+        # Metrics
+        cols = st.columns(4)
         am = sum(1 for r in results if r["Ad Score"]>=MATCH_THRESHOLD)
         pm = sum(1 for r in results if r["Pa Score"]>=MATCH_THRESHOLD)
         mm = sum(1 for r in results if r["MR Score"]>=MATCH_THRESHOLD)
         allm = sum(1 for r in results if r["Ad Score"]>=MATCH_THRESHOLD and r["Pa Score"]>=MATCH_THRESHOLD and r["MR Score"]>=MATCH_THRESHOLD)
-        c1.metric("Adintel Matches", f"{am}/{len(results)}")
-        c2.metric("Pathmatics Matches", f"{pm}/{len(results)}")
-        c3.metric("Media Radar Matches", f"{mm}/{len(results)}")
-        c4.metric("All Three Matched", f"{allm}/{len(results)}")
+        cols[0].metric("Adintel Matches", f"{am}/{len(results)}")
+        cols[1].metric("Pathmatics Matches", f"{pm}/{len(results)}")
+        cols[2].metric("Media Radar Matches", f"{mm}/{len(results)}")
+        cols[3].metric("All Three Matched", f"{allm}/{len(results)}")
 
         def hl(v):
             if "✅" in str(v): return "background-color: #C6EFCE"
