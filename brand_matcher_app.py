@@ -22,6 +22,85 @@ ADINTEL_REF = "adintel_brands.csv.gz"
 PATHMATICS_REF = "pathmatics_brands.csv.gz"
 MEDIARADAR_REF = "mediaradar_brands.csv.gz"
 
+# ── Common abbreviations (both directions) ──
+ABBREVIATIONS = {
+    "management": "mgmt", "mgmt": "management",
+    "international": "intl", "intl": "international",
+    "services": "svcs", "svcs": "services",
+    "service": "svc", "svc": "service",
+    "corporation": "corp", "corp": "corporation",
+    "company": "co", "co": "company",
+    "incorporated": "inc", "inc": "incorporated",
+    "limited": "ltd", "ltd": "limited",
+    "department": "dept", "dept": "department",
+    "association": "assn", "assn": "association",
+    "national": "natl", "natl": "national",
+    "american": "amer", "amer": "american",
+    "financial": "fin", "fin": "financial",
+    "insurance": "ins", "ins": "insurance",
+    "manufacturing": "mfg", "mfg": "manufacturing",
+    "technology": "tech", "tech": "technology",
+    "technologies": "tech", "tech": "technologies",
+    "products": "pdts", "pdts": "products",
+    "product": "pdt", "pdt": "product",
+    "laboratory": "lab", "lab": "laboratory",
+    "laboratories": "labs", "labs": "laboratories",
+    "pharmaceutical": "pharm", "pharm": "pharmaceutical",
+    "pharmaceuticals": "pharma", "pharma": "pharmaceuticals",
+    "communications": "comm", "comm": "communications",
+    "development": "dev", "dev": "development",
+    "engineering": "engr", "engr": "engineering",
+    "equipment": "equip", "equip": "equipment",
+    "distribution": "dist", "dist": "distribution",
+    "enterprises": "ent", "ent": "enterprises",
+    "properties": "prop", "prop": "properties",
+    "solutions": "sol", "sol": "solutions",
+    "systems": "sys", "sys": "systems",
+    "medical": "med", "med": "medical",
+    "healthcare": "hlthcr", "hlthcr": "healthcare",
+    "health": "hlth", "hlth": "health",
+    "advertising": "adv", "adv": "advertising",
+    "marketing": "mktg", "mktg": "marketing",
+    "real estate": "re", "re": "real estate",
+    "doctor": "dr", "dr": "doctor",
+    "university": "univ", "univ": "university",
+    "education": "edu", "edu": "education",
+    "restaurant": "rest", "rest": "restaurant",
+    "restaurants": "rests", "rests": "restaurants",
+    "supply": "sup", "sup": "supply",
+    "group": "grp", "grp": "group",
+    "partners": "ptnrs", "ptnrs": "partners",
+    "holdings": "hldgs", "hldgs": "holdings",
+    "industries": "ind", "ind": "industries",
+    "network": "ntwk", "ntwk": "network",
+    "digital": "dgtl", "dgtl": "digital",
+    "federal": "fed", "fed": "federal",
+    "government": "govt", "govt": "government",
+    "construction": "const", "const": "construction",
+    "consulting": "consult", "consult": "consulting",
+    "furniture": "furn", "furn": "furniture",
+    "automotive": "auto", "auto": "automotive",
+    "electric": "elec", "elec": "electric",
+    "electronics": "elec", "electrical": "elec",
+    "foundation": "fdn", "fdn": "foundation",
+    "brothers": "bros", "bros": "brothers",
+}
+
+def expand_abbreviations(text):
+    """Generate an alternate version with abbreviations expanded/contracted."""
+    words = text.split()
+    changed = False
+    new_words = []
+    for w in words:
+        if w in ABBREVIATIONS:
+            new_words.append(ABBREVIATIONS[w])
+            changed = True
+        else:
+            new_words.append(w)
+    if changed:
+        return " ".join(new_words)
+    return None
+
 # ── Normalization ──
 STRIP_SUFFIXES = (
     r'\b(inc|llc|llp|ltd|limited|lp|co|corp|corporate|corporation|company|'
@@ -40,14 +119,56 @@ STRIP_PATTERNS = [
 def normalize(name):
     if not isinstance(name, str): return ""
     s = name.strip()
+    # CamelCase splitting
     s = re.sub(r'([a-z])([A-Z])', r'\1 \2', s)
     s = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1 \2', s)
     s = s.lower()
+    # Remove non-ASCII
     s = re.sub(r'[^\x00-\x7f]', ' ', s)
+    # Separate digits from letters
     s = re.sub(r'(\d)([a-z])', r'\1 \2', s)
     s = re.sub(r'([a-z])(\d)', r'\1 \2', s)
+    # Strip patterns (apostrophes, suffixes, stop words, punctuation)
     for p in STRIP_PATTERNS: s = re.sub(p, ' ', s)
     return re.sub(r'\s+', ' ', s).strip()
+
+def normalize_nospace(name):
+    """Additional variant: remove all spaces (catches L'Occitane -> loccitane)."""
+    n = normalize(name)
+    return n.replace(" ", "") if n else ""
+
+def get_query_variants(query):
+    """
+    Generate multiple normalized variants of a query to try matching against.
+    Returns list of unique non-empty normalized strings.
+    """
+    variants = set()
+
+    n = normalize(query)
+    if n: variants.add(n)
+
+    # No-space version (L'Occitane -> loccitane)
+    ns = normalize_nospace(query)
+    if ns: variants.add(ns)
+
+    # Abbreviation-expanded version
+    if n:
+        expanded = expand_abbreviations(n)
+        if expanded: variants.add(expanded)
+
+    # Also try without CamelCase splitting (MDSolarSciences -> mdsolarsciencescorp -> mdsolarsciences)
+    s = query.strip().lower()
+    s = re.sub(r'[^\x00-\x7f]', ' ', s)
+    for p in STRIP_PATTERNS: s = re.sub(p, ' ', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    if s and s != n: variants.add(s)
+
+    # No-space of non-CamelCase version
+    sn = s.replace(" ", "") if s else ""
+    if sn: variants.add(sn)
+
+    return list(variants)
+
 
 def extract_name_parts(brand):
     parts = [brand.strip()]
@@ -74,12 +195,7 @@ def composite_score(q, c):
 
 
 class FastPairedMatcher:
-    """
-    Memory-efficient matching: stores only the deduped norm strings,
-    row indices, and the original DataFrame columns needed for results.
-    """
     def __init__(self, df, col1, col2, cat_col):
-        # Store only the 3 columns we need (not full DataFrame)
         self.col1_vals = df[col1].astype(str).tolist()
         self.col2_vals = df[col2].astype(str).tolist()
         self.cat_vals = df[cat_col].astype(str).tolist() if cat_col in df.columns else [""] * len(df)
@@ -89,13 +205,21 @@ class FastPairedMatcher:
         c1_norms = [normalize(v) for v in self.col1_vals]
         c2_norms = [normalize(v) for v in self.col2_vals]
 
+        # Also index no-space versions for matching things like LOccitane
         norm_to_row = {}
         for i, n in enumerate(c1_norms):
             if n and n not in norm_to_row:
                 norm_to_row[n] = i
+            # No-space variant
+            ns = n.replace(" ", "") if n else ""
+            if ns and ns not in norm_to_row:
+                norm_to_row[ns] = i
         for i, n in enumerate(c2_norms):
             if n and n not in norm_to_row:
                 norm_to_row[n] = i
+            ns = n.replace(" ", "") if n else ""
+            if ns and ns not in norm_to_row:
+                norm_to_row[ns] = i
 
         self.norm_strings = list(norm_to_row.keys())
         self.norm_to_row_idx = list(norm_to_row.values())
@@ -108,29 +232,34 @@ class FastPairedMatcher:
         best_row_idx = None
 
         for part in parts:
-            pn = normalize(part)
-            if not pn:
+            # Generate all variants of this query part
+            variants = get_query_variants(part)
+            if not variants:
                 continue
 
-            if pn in self.exact_lookup:
-                return self._make_result(self.exact_lookup[pn], 100.0)
+            # Try exact match with all variants first
+            for v in variants:
+                if v in self.exact_lookup:
+                    return self._make_result(self.exact_lookup[v], 100.0)
 
-            seen = set()
-            cands = []
-            for scorer in [fuzz.token_sort_ratio, fuzz.token_set_ratio, fuzz.partial_ratio]:
-                results = process.extract(pn, self.norm_strings, scorer=scorer,
-                                          limit=TOP_N_MATCHES * 3, score_cutoff=60)
-                if results:
-                    for ns, _, idx in results:
-                        if idx not in seen:
-                            seen.add(idx)
-                            cands.append((ns, idx))
+            # Fuzzy match — try each variant, keep best overall
+            for v in variants:
+                seen = set()
+                cands = []
+                for scorer in [fuzz.token_sort_ratio, fuzz.token_set_ratio, fuzz.partial_ratio]:
+                    results = process.extract(v, self.norm_strings, scorer=scorer,
+                                              limit=TOP_N_MATCHES * 3, score_cutoff=60)
+                    if results:
+                        for ns, _, idx in results:
+                            if idx not in seen:
+                                seen.add(idx)
+                                cands.append((ns, idx))
 
-            for ns, idx in cands:
-                sc = composite_score(pn, self.norm_strings[idx])
-                if sc > best_score:
-                    best_score = sc
-                    best_row_idx = self.norm_to_row_idx[idx]
+                for ns, idx in cands:
+                    sc = composite_score(v, self.norm_strings[idx])
+                    if sc > best_score:
+                        best_score = sc
+                        best_row_idx = self.norm_to_row_idx[idx]
 
             if best_score >= 100:
                 break
@@ -164,7 +293,6 @@ NO_MATCH = {"col1": "", "col2": "", "category": "", "score": 0.0}
 def load_and_build():
     matchers = {}
 
-    # Adintel
     ap = find_file(ADINTEL_REF)
     if ap:
         try:
@@ -174,7 +302,6 @@ def load_and_build():
         except Exception as e:
             print(f"Error loading Adintel: {e}")
 
-    # Pathmatics
     pp = find_file(PATHMATICS_REF)
     if pp:
         try:
@@ -184,7 +311,6 @@ def load_and_build():
         except Exception as e:
             print(f"Error loading Pathmatics: {e}")
 
-    # Media Radar
     mp = find_file(MEDIARADAR_REF)
     if mp:
         try:
@@ -208,7 +334,6 @@ def main():
         st.error("No reference files found. Run prepare_reference_data.py first.")
         st.stop()
 
-    # Status
     parts = []
     if "ad" in matchers:
         m = matchers["ad"]
@@ -278,7 +403,6 @@ def main():
         st.subheader(f"📊 Results ({len(results)} brands)")
         df_r = pd.DataFrame(results)
 
-        # Metrics
         cols = st.columns(4)
         am = sum(1 for r in results if r["Ad Score"]>=MATCH_THRESHOLD)
         pm = sum(1 for r in results if r["Pa Score"]>=MATCH_THRESHOLD)
