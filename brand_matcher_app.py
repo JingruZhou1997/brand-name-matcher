@@ -297,7 +297,7 @@ def load_and_build():
     if ap:
         try:
             df = pd.read_csv(ap, compression="gzip").fillna("")
-            matchers["ad"] = FastPairedMatcher(df, "Brand Core", "Subsidiary", "category")
+            matchers["ad"] = FastPairedMatcher(df, "Subsidiary", "Brand Core", "category")
             del df; gc.collect()
         except Exception as e:
             print(f"Error loading Adintel: {e}")
@@ -384,8 +384,8 @@ def main():
 
             results.append({
                 "Input Brand": brand,
-                "Ad Brand Core": val_or_dash(ad_res, "col1", ads),
-                "Ad Subsidiary": val_or_dash(ad_res, "col2", ads),
+                "Ad Subsidiary": val_or_dash(ad_res, "col1", ads),
+                "Ad Brand Core": val_or_dash(ad_res, "col2", ads),
                 "Ad Category": cat_or_empty(ad_res, ads),
                 "Ad Confidence": status(ads), "Ad Score": round(ads),
                 "Pa Advertiser": val_or_dash(pa_res, "col1", pas),
@@ -420,7 +420,7 @@ def main():
             return ""
 
         show_cols = ["Input Brand",
-                     "Ad Brand Core", "Ad Subsidiary", "Ad Category", "Ad Confidence",
+                     "Ad Subsidiary", "Ad Brand Core", "Ad Category", "Ad Confidence",
                      "Pa Advertiser", "Pa Brand Leaf", "Pa Category", "Pa Confidence",
                      "MR Parent", "MR Product Line", "MR Category", "MR Confidence"]
         styled = df_r[show_cols].style.applymap(hl, subset=["Ad Confidence", "Pa Confidence", "MR Confidence"])
