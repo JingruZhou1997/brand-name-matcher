@@ -1,7 +1,7 @@
 """
 Brand Name Matcher - Streamlit App
 ====================================
-Matches against Adintel, Pathmatics, and Media Radar.
+Matches against Adintel (3 columns), Pathmatics (2 columns), Media Radar (2 columns).
 """
 
 import streamlit as st
@@ -22,7 +22,7 @@ ADINTEL_REF = "adintel_brands.csv.gz"
 PATHMATICS_REF = "pathmatics_brands.csv.gz"
 MEDIARADAR_REF = "mediaradar_brands.csv.gz"
 
-# ── Common abbreviations (both directions) ──
+# ── Common abbreviations ──
 ABBREVIATIONS = {
     "management": "mgmt", "mgmt": "management",
     "international": "intl", "intl": "international",
@@ -40,7 +40,7 @@ ABBREVIATIONS = {
     "insurance": "ins", "ins": "insurance",
     "manufacturing": "mfg", "mfg": "manufacturing",
     "technology": "tech", "tech": "technology",
-    "technologies": "tech", "tech": "technologies",
+    "technologies": "tech",
     "products": "pdts", "pdts": "products",
     "product": "pdt", "pdt": "product",
     "laboratory": "lab", "lab": "laboratory",
@@ -61,12 +61,10 @@ ABBREVIATIONS = {
     "health": "hlth", "hlth": "health",
     "advertising": "adv", "adv": "advertising",
     "marketing": "mktg", "mktg": "marketing",
-    "real estate": "re", "re": "real estate",
     "doctor": "dr", "dr": "doctor",
     "university": "univ", "univ": "university",
     "education": "edu", "edu": "education",
     "restaurant": "rest", "rest": "restaurant",
-    "restaurants": "rests", "rests": "restaurants",
     "supply": "sup", "sup": "supply",
     "group": "grp", "grp": "group",
     "partners": "ptnrs", "ptnrs": "partners",
@@ -74,20 +72,17 @@ ABBREVIATIONS = {
     "industries": "ind", "ind": "industries",
     "network": "ntwk", "ntwk": "network",
     "digital": "dgtl", "dgtl": "digital",
-    "federal": "fed", "fed": "federal",
-    "government": "govt", "govt": "government",
     "construction": "const", "const": "construction",
     "consulting": "consult", "consult": "consulting",
-    "furniture": "furn", "furn": "furniture",
     "automotive": "auto", "auto": "automotive",
     "electric": "elec", "elec": "electric",
     "electronics": "elec", "electrical": "elec",
     "foundation": "fdn", "fdn": "foundation",
     "brothers": "bros", "bros": "brothers",
+    "center": "ctr", "ctr": "center",
 }
 
 def expand_abbreviations(text):
-    """Generate an alternate version with abbreviations expanded/contracted."""
     words = text.split()
     changed = False
     new_words = []
@@ -119,56 +114,32 @@ STRIP_PATTERNS = [
 def normalize(name):
     if not isinstance(name, str): return ""
     s = name.strip()
-    # CamelCase splitting
     s = re.sub(r'([a-z])([A-Z])', r'\1 \2', s)
     s = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1 \2', s)
     s = s.lower()
-    # Remove non-ASCII
     s = re.sub(r'[^\x00-\x7f]', ' ', s)
-    # Separate digits from letters
     s = re.sub(r'(\d)([a-z])', r'\1 \2', s)
     s = re.sub(r'([a-z])(\d)', r'\1 \2', s)
-    # Strip patterns (apostrophes, suffixes, stop words, punctuation)
     for p in STRIP_PATTERNS: s = re.sub(p, ' ', s)
     return re.sub(r'\s+', ' ', s).strip()
 
-def normalize_nospace(name):
-    """Additional variant: remove all spaces (catches L'Occitane -> loccitane)."""
-    n = normalize(name)
-    return n.replace(" ", "") if n else ""
-
 def get_query_variants(query):
-    """
-    Generate multiple normalized variants of a query to try matching against.
-    Returns list of unique non-empty normalized strings.
-    """
     variants = set()
-
     n = normalize(query)
     if n: variants.add(n)
-
-    # No-space version (L'Occitane -> loccitane)
-    ns = normalize_nospace(query)
+    ns = n.replace(" ", "") if n else ""
     if ns: variants.add(ns)
-
-    # Abbreviation-expanded version
     if n:
         expanded = expand_abbreviations(n)
         if expanded: variants.add(expanded)
-
-    # Also try without CamelCase splitting (MDSolarSciences -> mdsolarsciencescorp -> mdsolarsciences)
     s = query.strip().lower()
     s = re.sub(r'[^\x00-\x7f]', ' ', s)
     for p in STRIP_PATTERNS: s = re.sub(p, ' ', s)
     s = re.sub(r'\s+', ' ', s).strip()
     if s and s != n: variants.add(s)
-
-    # No-space of non-CamelCase version
     sn = s.replace(" ", "") if s else ""
     if sn: variants.add(sn)
-
     return list(variants)
-
 
 def extract_name_parts(brand):
     parts = [brand.strip()]
@@ -194,37 +165,43 @@ def composite_score(q, c):
     return base
 
 
-class FastPairedMatcher:
-    def __init__(self, df, col1, col2, cat_col):
-        self.col1_vals = df[col1].astype(str).tolist()
-        self.col2_vals = df[col2].astype(str).tolist()
-        self.cat_vals = df[cat_col].astype(str).tolist() if cat_col in df.columns else [""] * len(df)
-        self.col1 = col1
-        self.col2 = col2
+class FastMultiColMatcher:
+    """
+    Matcher that indexes multiple columns into one deduped search list.
+    Works for both 2-column (Pathmatics, Media Radar) and 3-column (Adintel) sources.
 
-        c1_norms = [normalize(v) for v in self.col1_vals]
-        c2_norms = [normalize(v) for v in self.col2_vals]
+    Each normalized string maps back to its row index, so we can return
+    all original column values for the matched row.
+    """
+    def __init__(self, df, search_cols, display_cols, cat_col):
+        self.display_cols = display_cols
+        self.cat_col = cat_col
+        self.n_pairs = len(df)
 
-        # Also index no-space versions for matching things like LOccitane
+        # Store column values as lists (memory efficient)
+        self.col_data = {}
+        for col in set(search_cols + display_cols + [cat_col]):
+            if col in df.columns:
+                self.col_data[col] = df[col].astype(str).tolist()
+
+        # Build deduped index from ALL search columns
         norm_to_row = {}
-        for i, n in enumerate(c1_norms):
-            if n and n not in norm_to_row:
-                norm_to_row[n] = i
-            # No-space variant
-            ns = n.replace(" ", "") if n else ""
-            if ns and ns not in norm_to_row:
-                norm_to_row[ns] = i
-        for i, n in enumerate(c2_norms):
-            if n and n not in norm_to_row:
-                norm_to_row[n] = i
-            ns = n.replace(" ", "") if n else ""
-            if ns and ns not in norm_to_row:
-                norm_to_row[ns] = i
+        for col in search_cols:
+            if col not in self.col_data:
+                continue
+            vals = self.col_data[col]
+            for i, v in enumerate(vals):
+                n = normalize(v)
+                if n and n not in norm_to_row:
+                    norm_to_row[n] = i
+                # Also index no-space variant
+                ns = n.replace(" ", "") if n else ""
+                if ns and ns not in norm_to_row:
+                    norm_to_row[ns] = i
 
         self.norm_strings = list(norm_to_row.keys())
         self.norm_to_row_idx = list(norm_to_row.values())
         self.exact_lookup = norm_to_row
-        self.n_pairs = len(df)
 
     def find_best(self, query):
         parts = extract_name_parts(query)
@@ -232,17 +209,14 @@ class FastPairedMatcher:
         best_row_idx = None
 
         for part in parts:
-            # Generate all variants of this query part
             variants = get_query_variants(part)
             if not variants:
                 continue
 
-            # Try exact match with all variants first
             for v in variants:
                 if v in self.exact_lookup:
                     return self._make_result(self.exact_lookup[v], 100.0)
 
-            # Fuzzy match — try each variant, keep best overall
             for v in variants:
                 seen = set()
                 cands = []
@@ -266,15 +240,14 @@ class FastPairedMatcher:
 
         if best_row_idx is not None:
             return self._make_result(best_row_idx, best_score)
-        return {"col1": "NO MATCH", "col2": "", "category": "", "score": 0.0}
+        return {col: "" for col in self.display_cols} | {"category": "", "score": 0.0}
 
     def _make_result(self, row_idx, score):
-        return {
-            "col1": self.col1_vals[row_idx],
-            "col2": self.col2_vals[row_idx],
-            "category": self.cat_vals[row_idx],
-            "score": score,
-        }
+        result = {"score": score}
+        for col in self.display_cols:
+            result[col] = self.col_data[col][row_idx] if col in self.col_data else ""
+        result["category"] = self.col_data[self.cat_col][row_idx] if self.cat_col in self.col_data else ""
+        return result
 
 
 def find_file(filename):
@@ -286,36 +259,51 @@ def find_file(filename):
     return None
 
 
-NO_MATCH = {"col1": "", "col2": "", "category": "", "score": 0.0}
-
-
 @st.cache_resource(show_spinner="Loading and indexing reference data...")
 def load_and_build():
     matchers = {}
 
+    # Adintel — 3 searchable columns, display Subsidiary + Brand Core + Brand Extension
     ap = find_file(ADINTEL_REF)
     if ap:
         try:
             df = pd.read_csv(ap, compression="gzip").fillna("")
-            matchers["ad"] = FastPairedMatcher(df, "Subsidiary", "Brand Core", "category")
+            matchers["ad"] = FastMultiColMatcher(
+                df,
+                search_cols=["Subsidiary", "Brand Core", "Brand Extension"],
+                display_cols=["Subsidiary", "Brand Core", "Brand Extension"],
+                cat_col="category"
+            )
             del df; gc.collect()
         except Exception as e:
             print(f"Error loading Adintel: {e}")
 
+    # Pathmatics — 2 columns
     pp = find_file(PATHMATICS_REF)
     if pp:
         try:
             df = pd.read_csv(pp, compression="gzip").fillna("")
-            matchers["pa"] = FastPairedMatcher(df, "Advertiser", "Brand Leaf", "category")
+            matchers["pa"] = FastMultiColMatcher(
+                df,
+                search_cols=["Advertiser", "Brand Leaf"],
+                display_cols=["Advertiser", "Brand Leaf"],
+                cat_col="category"
+            )
             del df; gc.collect()
         except Exception as e:
             print(f"Error loading Pathmatics: {e}")
 
+    # Media Radar — 2 columns
     mp = find_file(MEDIARADAR_REF)
     if mp:
         try:
             df = pd.read_csv(mp, compression="gzip").fillna("")
-            matchers["mr"] = FastPairedMatcher(df, "Parent", "Product Line", "category")
+            matchers["mr"] = FastMultiColMatcher(
+                df,
+                search_cols=["Parent", "Product Line"],
+                display_cols=["Parent", "Product Line"],
+                cat_col="category"
+            )
             del df; gc.collect()
         except Exception as e:
             print(f"Error loading Media Radar: {e}")
@@ -353,10 +341,15 @@ def main():
     st.subheader("📋 Enter Brand Names")
     st.markdown("Paste brand names below — **one per line**:")
     brand_input = st.text_area("Brand names", height=300,
-        placeholder="111skin\nLimeLife USA LLC\nCovetrus (SmartPak Equine)\n...", label_visibility="collapsed")
+        placeholder="Legoland Florida\nBlue Cross Blue Shield of Michigan\nCovetrus (SmartPak Equine)\n...",
+        label_visibility="collapsed")
 
     col1, col2 = st.columns([1, 4])
     with col1: run_btn = st.button("🚀 Match Brands", type="primary", use_container_width=True)
+
+    NO_AD = {"Subsidiary": "", "Brand Core": "", "Brand Extension": "", "category": "", "score": 0.0}
+    NO_PA = {"Advertiser": "", "Brand Leaf": "", "category": "", "score": 0.0}
+    NO_MR = {"Parent": "", "Product Line": "", "category": "", "score": 0.0}
 
     if run_btn and brand_input.strip():
         brands = [b.strip() for b in brand_input.strip().split('\n') if b.strip()]
@@ -366,9 +359,9 @@ def main():
         progress = st.progress(0, text="Matching brands...")
 
         for i, brand in enumerate(brands):
-            ad_res = matchers["ad"].find_best(brand) if "ad" in matchers else NO_MATCH
-            pa_res = matchers["pa"].find_best(brand) if "pa" in matchers else NO_MATCH
-            mr_res = matchers["mr"].find_best(brand) if "mr" in matchers else NO_MATCH
+            ad_res = matchers["ad"].find_best(brand) if "ad" in matchers else NO_AD
+            pa_res = matchers["pa"].find_best(brand) if "pa" in matchers else NO_PA
+            mr_res = matchers["mr"].find_best(brand) if "mr" in matchers else NO_MR
             ads, pas, mrs = ad_res["score"], pa_res["score"], mr_res["score"]
 
             def status(score):
@@ -377,23 +370,24 @@ def main():
                 else: return "❌ Needs Review"
 
             def val_or_dash(res, key, score):
-                return res[key] if score >= SUGGEST_THRESHOLD else "—"
+                return res.get(key, "") if score >= SUGGEST_THRESHOLD else "—"
 
             def cat_or_empty(res, score):
-                return res["category"] if score >= SUGGEST_THRESHOLD else ""
+                return res.get("category", "") if score >= SUGGEST_THRESHOLD else ""
 
             results.append({
                 "Input Brand": brand,
-                "Ad Subsidiary": val_or_dash(ad_res, "col1", ads),
-                "Ad Brand Core": val_or_dash(ad_res, "col2", ads),
+                "Ad Subsidiary": val_or_dash(ad_res, "Subsidiary", ads),
+                "Ad Brand Core": val_or_dash(ad_res, "Brand Core", ads),
+                "Ad Brand Extension": val_or_dash(ad_res, "Brand Extension", ads),
                 "Ad Category": cat_or_empty(ad_res, ads),
                 "Ad Confidence": status(ads), "Ad Score": round(ads),
-                "Pa Advertiser": val_or_dash(pa_res, "col1", pas),
-                "Pa Brand Leaf": val_or_dash(pa_res, "col2", pas),
+                "Pa Advertiser": val_or_dash(pa_res, "Advertiser", pas),
+                "Pa Brand Leaf": val_or_dash(pa_res, "Brand Leaf", pas),
                 "Pa Category": cat_or_empty(pa_res, pas),
                 "Pa Confidence": status(pas), "Pa Score": round(pas),
-                "MR Parent": val_or_dash(mr_res, "col1", mrs),
-                "MR Product Line": val_or_dash(mr_res, "col2", mrs),
+                "MR Parent": val_or_dash(mr_res, "Parent", mrs),
+                "MR Product Line": val_or_dash(mr_res, "Product Line", mrs),
                 "MR Category": cat_or_empty(mr_res, mrs),
                 "MR Confidence": status(mrs), "MR Score": round(mrs),
             })
@@ -420,7 +414,7 @@ def main():
             return ""
 
         show_cols = ["Input Brand",
-                     "Ad Subsidiary", "Ad Brand Core", "Ad Category", "Ad Confidence",
+                     "Ad Subsidiary", "Ad Brand Core", "Ad Brand Extension", "Ad Category", "Ad Confidence",
                      "Pa Advertiser", "Pa Brand Leaf", "Pa Category", "Pa Confidence",
                      "MR Parent", "MR Product Line", "MR Category", "MR Confidence"]
         styled = df_r[show_cols].style.applymap(hl, subset=["Ad Confidence", "Pa Confidence", "MR Confidence"])
