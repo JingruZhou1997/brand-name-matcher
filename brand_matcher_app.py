@@ -1,8 +1,8 @@
 """
 Brand Name Matcher - Streamlit App
 ====================================
-Adintel: returns ALL matches above threshold (multi-row per brand)
-Pathmatics & Media Radar: return single best match per brand
+Adintel: returns ALL brand variants above threshold
+Pathmatics & Media Radar: return single best match
 """
 
 import streamlit as st
@@ -165,26 +165,25 @@ def composite_score(q, c):
 
 
 class FastMultiColMatcher:
-    """
-    Indexes multiple columns into one deduped search list.
-    Supports both single-best and find-all modes.
-    """
-    def __init__(self, df, search_cols, display_cols, cat_col):
+    """Indexes multiple columns. Supports find_best (single) and find_all (multi-row)."""
+
+    def __init__(self, df, search_cols, display_cols, cat_col, expand_col=None):
         self.display_cols = display_cols
         self.cat_col = cat_col
+        self.expand_col = expand_col  # Column to use for starts-with expansion
         self.n_pairs = len(df)
 
-        # Store column values as lists
         self.col_data = {}
-        for col in set(search_cols + display_cols + [cat_col]):
+        all_cols = set(search_cols + display_cols + [cat_col])
+        if expand_col: all_cols.add(expand_col)
+        for col in all_cols:
             if col in df.columns:
                 self.col_data[col] = df[col].astype(str).tolist()
 
-        # Build deduped index: norm_string -> first row index
+        # Build deduped index from search columns
         norm_to_row = {}
         for col in search_cols:
-            if col not in self.col_data:
-                continue
+            if col not in self.col_data: continue
             vals = self.col_data[col]
             for i, v in enumerate(vals):
                 n = normalize(v)
@@ -198,12 +197,13 @@ class FastMultiColMatcher:
         self.norm_to_row_idx = list(norm_to_row.values())
         self.exact_lookup = norm_to_row
 
-        # For find_all: build reverse index from Brand Core norm -> all row indices
-        # This lets us find all variants of a matched brand
-        self.search_cols = search_cols
+        # Pre-build uppercase Brand Variant list for fast expansion
+        if expand_col and expand_col in self.col_data:
+            self.expand_upper = [v.strip().upper() for v in self.col_data[expand_col]]
+        else:
+            self.expand_upper = None
 
     def find_best(self, query):
-        """Return single best match."""
         parts = extract_name_parts(query)
         best_score = 0.0
         best_row_idx = None
@@ -211,29 +211,23 @@ class FastMultiColMatcher:
         for part in parts:
             variants = get_query_variants(part)
             if not variants: continue
-
             for v in variants:
                 if v in self.exact_lookup:
                     return self._make_result(self.exact_lookup[v], 100.0)
-
             for v in variants:
-                seen = set()
-                cands = []
+                seen = set(); cands = []
                 for scorer in [fuzz.token_sort_ratio, fuzz.token_set_ratio, fuzz.partial_ratio]:
                     results = process.extract(v, self.norm_strings, scorer=scorer,
                                               limit=TOP_N_MATCHES * 3, score_cutoff=60)
                     if results:
                         for ns, _, idx in results:
                             if idx not in seen:
-                                seen.add(idx)
-                                cands.append((ns, idx))
-
+                                seen.add(idx); cands.append((ns, idx))
                 for ns, idx in cands:
                     sc = composite_score(v, self.norm_strings[idx])
                     if sc > best_score:
                         best_score = sc
                         best_row_idx = self.norm_to_row_idx[idx]
-
             if best_score >= 100: break
 
         if best_row_idx is not None:
@@ -242,12 +236,9 @@ class FastMultiColMatcher:
 
     def find_all(self, query, threshold=SUGGEST_THRESHOLD):
         """
-        Return ALL rows where any search column matches the query above threshold.
-
-        Strategy:
-        1. Find the best match (to get the matched normalized string)
-        2. Use that match to find all rows containing similar brand names
-        3. Score each row independently and return all above threshold
+        Find ALL rows matching the query:
+        1. Fuzzy match to find initial hits
+        2. Expand: find all rows where Brand Variant starts with the query or matched brand name
         """
         parts = extract_name_parts(query)
         query_norms = set()
@@ -258,15 +249,11 @@ class FastMultiColMatcher:
         if not query_norms:
             return []
 
-        # Collect all candidate row indices with their scores
-        row_scores = {}  # row_idx -> best score
-
+        # Step 1: Collect initial fuzzy matches
+        row_scores = {}
         for qn in query_norms:
-            # Exact matches
             if qn in self.exact_lookup:
                 row_scores[self.exact_lookup[qn]] = 100.0
-
-            # Fuzzy matches — get more candidates for find_all
             seen = set()
             for scorer in [fuzz.token_sort_ratio, fuzz.token_set_ratio, fuzz.partial_ratio]:
                 results = process.extract(qn, self.norm_strings, scorer=scorer,
@@ -280,43 +267,41 @@ class FastMultiColMatcher:
                             if ri not in row_scores or sc > row_scores[ri]:
                                 row_scores[ri] = sc
 
-        # Now expand: find ALL rows where Brand Core starts with any matched
-        # brand name or the original query. This catches "LEGOLAND FLORIDA",
-        # "LEGOLAND CALIFORNIA" etc. when searching "Legoland".
-        if "Brand Core" in self.col_data:
-            # Collect prefixes to search for: matched Brand Cores + original query words
+        # Step 2: Expand using Brand Variant starts-with
+        if self.expand_upper is not None:
+            # Build prefixes from: query itself + matched Brand Core values
             prefixes = set()
-            for ri, sc in row_scores.items():
-                if sc >= threshold:
-                    core = self.col_data["Brand Core"][ri].strip().upper()
-                    if core:
-                        prefixes.add(core)
 
-            # Also add the normalized query itself as a prefix
-            for part in extract_name_parts(query):
-                n = normalize(part).upper()
-                if n and len(n) >= 3:
-                    prefixes.add(n)
+            # Add the raw query as prefix (e.g. "LEGOLAND")
+            for part in parts:
+                raw = part.strip().upper()
+                if raw and len(raw) >= 3:
+                    prefixes.add(raw)
 
-            # Find all rows where Brand Core starts with any prefix
+            # Add matched Brand Core values as prefixes
+            if "Brand Core" in self.col_data:
+                for ri, sc in row_scores.items():
+                    if sc >= threshold:
+                        core = self.col_data["Brand Core"][ri].strip().upper()
+                        if core and len(core) >= 3:
+                            prefixes.add(core)
+
+            # Scan all Brand Variants for starts-with match
             if prefixes:
-                all_cores = self.col_data["Brand Core"]
-                for i, core_val in enumerate(all_cores):
-                    cv = core_val.strip().upper()
-                    if not cv:
+                for i, bv_upper in enumerate(self.expand_upper):
+                    if not bv_upper:
                         continue
                     for prefix in prefixes:
-                        if cv.startswith(prefix) or cv == prefix:
+                        if bv_upper.startswith(prefix):
                             if i not in row_scores:
                                 row_scores[i] = 100.0
                             break
 
-        # Filter by threshold and build results
+        # Step 3: Filter and return
         matches = []
         for ri, sc in sorted(row_scores.items(), key=lambda x: -x[1]):
             if sc >= threshold:
                 matches.append(self._make_result(ri, sc))
-
         return matches
 
     def _make_result(self, row_idx, score):
@@ -346,9 +331,10 @@ def load_and_build():
             df = pd.read_csv(ap, compression="gzip").fillna("")
             matchers["ad"] = FastMultiColMatcher(
                 df,
-                search_cols=["Subsidiary", "Brand Core", "Brand Extension"],
-                display_cols=["Subsidiary", "Brand Core", "Brand Extension"],
-                cat_col="category"
+                search_cols=["Subsidiary", "Brand Core"],
+                display_cols=["Subsidiary", "Brand Core", "Brand Variant"],
+                cat_col="category",
+                expand_col="Brand Variant"  # Expand using Brand Variant starts-with
             )
             del df; gc.collect()
         except Exception as e:
@@ -417,7 +403,7 @@ def main():
 
     missing = [n for k, n in [("ad","Adintel"),("pa","Pathmatics"),("mr","Media Radar")] if k not in matchers]
     if missing:
-        st.warning(f"⚠️ Missing: {', '.join(missing)} — those columns will show '—'")
+        st.warning(f"⚠️ Missing: {', '.join(missing)}")
 
     st.subheader("📋 Enter Brand Names")
     st.markdown("Paste brand names below — **one per line**:")
@@ -440,25 +426,21 @@ def main():
 
         for i, brand in enumerate(brands):
             # Adintel: find ALL matches
-            if "ad" in matchers:
-                ad_all = matchers["ad"].find_all(brand)
-            else:
-                ad_all = []
+            ad_all = matchers["ad"].find_all(brand) if "ad" in matchers else []
 
-            # Pathmatics & Media Radar: single best match
+            # Pathmatics & Media Radar: single best
             pa_res = matchers["pa"].find_best(brand) if "pa" in matchers else NO_PA
             mr_res = matchers["mr"].find_best(brand) if "mr" in matchers else NO_MR
             pas, mrs = pa_res["score"], mr_res["score"]
 
             if ad_all:
-                # One row per Adintel match, Pa/MR repeated on first row only
                 for j, ad_res in enumerate(ad_all):
                     ads = ad_res["score"]
                     row = {
                         "Input Brand": brand if j == 0 else "",
                         "Ad Subsidiary": ad_res.get("Subsidiary", ""),
                         "Ad Brand Core": ad_res.get("Brand Core", ""),
-                        "Ad Brand Extension": ad_res.get("Brand Extension", ""),
+                        "Ad Brand Variant": ad_res.get("Brand Variant", ""),
                         "Ad Category": ad_res.get("category", ""),
                         "Ad Confidence": status_label(ads),
                     }
@@ -484,10 +466,9 @@ def main():
                     row["_is_first"] = (j == 0)
                     results.append(row)
             else:
-                # No Adintel match
                 results.append({
                     "Input Brand": brand,
-                    "Ad Subsidiary": "—", "Ad Brand Core": "—", "Ad Brand Extension": "—",
+                    "Ad Subsidiary": "—", "Ad Brand Core": "—", "Ad Brand Variant": "—",
                     "Ad Category": "", "Ad Confidence": "❌ Needs Review",
                     "Pa Advertiser": pa_res.get("Advertiser", "") if pas >= SUGGEST_THRESHOLD else "—",
                     "Pa Brand Leaf": pa_res.get("Brand Leaf", "") if pas >= SUGGEST_THRESHOLD else "—",
@@ -504,10 +485,9 @@ def main():
 
         progress.empty()
 
-        # Count stats (only from first rows)
         first_rows = [r for r in results if r["_is_first"]]
         n_brands = len(first_rows)
-        am = sum(1 for r in results if r["_ad_score"] >= MATCH_THRESHOLD and r["_is_first"])
+        am = sum(1 for r in first_rows if r["_ad_score"] >= MATCH_THRESHOLD)
         pm = sum(1 for r in first_rows if r["_pa_score"] >= MATCH_THRESHOLD)
         mm = sum(1 for r in first_rows if r["_mr_score"] >= MATCH_THRESHOLD)
         total_ad_rows = sum(1 for r in results if r["_ad_score"] >= SUGGEST_THRESHOLD)
@@ -528,13 +508,12 @@ def main():
 
         df_r = pd.DataFrame(results)
         show_cols = ["Input Brand",
-                     "Ad Subsidiary", "Ad Brand Core", "Ad Brand Extension", "Ad Category", "Ad Confidence",
+                     "Ad Subsidiary", "Ad Brand Core", "Ad Brand Variant", "Ad Category", "Ad Confidence",
                      "Pa Advertiser", "Pa Brand Leaf", "Pa Category", "Pa Confidence",
                      "MR Parent", "MR Product Line", "MR Category", "MR Confidence"]
         styled = df_r[show_cols].style.applymap(hl, subset=["Ad Confidence", "Pa Confidence", "MR Confidence"])
         st.dataframe(styled, use_container_width=True, height=min(len(results)*40+50, 800))
 
-        # Download
         st.markdown("---")
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as w:
