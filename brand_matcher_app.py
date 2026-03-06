@@ -280,23 +280,36 @@ class FastMultiColMatcher:
                             if ri not in row_scores or sc > row_scores[ri]:
                                 row_scores[ri] = sc
 
-        # Now expand: for each matched row, find ALL rows with the same Brand Core
-        # This catches "LEGOLAND FLORIDA", "LEGOLAND CALIFORNIA" etc.
+        # Now expand: find ALL rows where Brand Core starts with any matched
+        # brand name or the original query. This catches "LEGOLAND FLORIDA",
+        # "LEGOLAND CALIFORNIA" etc. when searching "Legoland".
         if "Brand Core" in self.col_data:
-            brand_cores_to_find = set()
+            # Collect prefixes to search for: matched Brand Cores + original query words
+            prefixes = set()
             for ri, sc in row_scores.items():
                 if sc >= threshold:
                     core = self.col_data["Brand Core"][ri].strip().upper()
                     if core:
-                        brand_cores_to_find.add(core)
+                        prefixes.add(core)
 
-            # Find all rows with matching Brand Core
-            if brand_cores_to_find:
+            # Also add the normalized query itself as a prefix
+            for part in extract_name_parts(query):
+                n = normalize(part).upper()
+                if n and len(n) >= 3:
+                    prefixes.add(n)
+
+            # Find all rows where Brand Core starts with any prefix
+            if prefixes:
                 all_cores = self.col_data["Brand Core"]
                 for i, core_val in enumerate(all_cores):
-                    if core_val.strip().upper() in brand_cores_to_find:
-                        if i not in row_scores:
-                            row_scores[i] = 100.0  # Same Brand Core family = Match
+                    cv = core_val.strip().upper()
+                    if not cv:
+                        continue
+                    for prefix in prefixes:
+                        if cv.startswith(prefix) or cv == prefix:
+                            if i not in row_scores:
+                                row_scores[i] = 100.0
+                            break
 
         # Filter by threshold and build results
         matches = []
