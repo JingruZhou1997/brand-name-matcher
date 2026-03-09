@@ -1,7 +1,7 @@
 """
 Brand Name Matcher - Streamlit App
 ====================================
-Adintel: returns ALL brand variants above threshold
+Adintel: returns ALL brand variants (loaded from multiple part files if needed)
 Pathmatics & Media Radar: return single best match
 """
 
@@ -11,6 +11,7 @@ import re
 import io
 import os
 import gc
+import glob
 from rapidfuzz import fuzz, process
 from datetime import datetime
 
@@ -19,7 +20,6 @@ st.set_page_config(page_title="Brand Name Matcher", page_icon="🔍", layout="wi
 TOP_N_MATCHES = 3
 MATCH_THRESHOLD = 95
 SUGGEST_THRESHOLD = 90
-ADINTEL_REF = "adintel_brands.csv.gz"
 PATHMATICS_REF = "pathmatics_brands.csv.gz"
 MEDIARADAR_REF = "mediaradar_brands.csv.gz"
 
@@ -43,7 +43,6 @@ ABBREVIATIONS = {
     "technology": "tech", "tech": "technology",
     "technologies": "tech",
     "products": "pdts", "pdts": "products",
-    "product": "pdt", "pdt": "product",
     "laboratory": "lab", "lab": "laboratory",
     "laboratories": "labs", "labs": "laboratories",
     "pharmaceutical": "pharm", "pharm": "pharmaceutical",
@@ -58,7 +57,6 @@ ABBREVIATIONS = {
     "solutions": "sol", "sol": "solutions",
     "systems": "sys", "sys": "systems",
     "medical": "med", "med": "medical",
-    "healthcare": "hlthcr", "hlthcr": "healthcare",
     "health": "hlth", "hlth": "health",
     "advertising": "adv", "adv": "advertising",
     "marketing": "mktg", "mktg": "marketing",
@@ -165,12 +163,10 @@ def composite_score(q, c):
 
 
 class FastMultiColMatcher:
-    """Indexes multiple columns. Supports find_best (single) and find_all (multi-row)."""
-
     def __init__(self, df, search_cols, display_cols, cat_col, expand_col=None):
         self.display_cols = display_cols
         self.cat_col = cat_col
-        self.expand_col = expand_col  # Column to use for starts-with expansion
+        self.expand_col = expand_col
         self.n_pairs = len(df)
 
         self.col_data = {}
@@ -180,7 +176,6 @@ class FastMultiColMatcher:
             if col in df.columns:
                 self.col_data[col] = df[col].astype(str).tolist()
 
-        # Build deduped index from search columns
         norm_to_row = {}
         for col in search_cols:
             if col not in self.col_data: continue
@@ -197,7 +192,6 @@ class FastMultiColMatcher:
         self.norm_to_row_idx = list(norm_to_row.values())
         self.exact_lookup = norm_to_row
 
-        # Pre-build uppercase Brand Variant list for fast expansion
         if expand_col and expand_col in self.col_data:
             self.expand_upper = [v.strip().upper() for v in self.col_data[expand_col]]
         else:
@@ -207,7 +201,6 @@ class FastMultiColMatcher:
         parts = extract_name_parts(query)
         best_score = 0.0
         best_row_idx = None
-
         for part in parts:
             variants = get_query_variants(part)
             if not variants: continue
@@ -229,27 +222,19 @@ class FastMultiColMatcher:
                         best_score = sc
                         best_row_idx = self.norm_to_row_idx[idx]
             if best_score >= 100: break
-
         if best_row_idx is not None:
             return self._make_result(best_row_idx, best_score)
         return {col: "" for col in self.display_cols} | {"category": "", "score": 0.0}
 
     def find_all(self, query, threshold=SUGGEST_THRESHOLD):
-        """
-        Find ALL rows matching the query:
-        1. Fuzzy match to find initial hits
-        2. Expand: find all rows where Brand Variant starts with the query or matched brand name
-        """
         parts = extract_name_parts(query)
         query_norms = set()
         for part in parts:
             for v in get_query_variants(part):
                 if v: query_norms.add(v)
-
         if not query_norms:
             return []
 
-        # Step 1: Collect initial fuzzy matches
         row_scores = {}
         for qn in query_norms:
             if qn in self.exact_lookup:
@@ -267,37 +252,28 @@ class FastMultiColMatcher:
                             if ri not in row_scores or sc > row_scores[ri]:
                                 row_scores[ri] = sc
 
-        # Step 2: Expand using Brand Variant starts-with
+        # Expand via Brand Variant starts-with
         if self.expand_upper is not None:
-            # Build prefixes from: query itself + matched Brand Core values
             prefixes = set()
-
-            # Add the raw query as prefix (e.g. "LEGOLAND")
             for part in parts:
                 raw = part.strip().upper()
                 if raw and len(raw) >= 3:
                     prefixes.add(raw)
-
-            # Add matched Brand Core values as prefixes
             if "Brand Core" in self.col_data:
                 for ri, sc in row_scores.items():
                     if sc >= threshold:
                         core = self.col_data["Brand Core"][ri].strip().upper()
                         if core and len(core) >= 3:
                             prefixes.add(core)
-
-            # Scan all Brand Variants for starts-with match
             if prefixes:
                 for i, bv_upper in enumerate(self.expand_upper):
-                    if not bv_upper:
-                        continue
+                    if not bv_upper: continue
                     for prefix in prefixes:
                         if bv_upper.startswith(prefix):
                             if i not in row_scores:
                                 row_scores[i] = 100.0
                             break
 
-        # Step 3: Filter and return
         matches = []
         for ri, sc in sorted(row_scores.items(), key=lambda x: -x[1]):
             if sc >= threshold:
@@ -321,20 +297,41 @@ def find_file(filename):
     return None
 
 
+def find_adintel_files():
+    """Find adintel .gz files — either single file or multiple parts."""
+    for d in [os.path.dirname(os.path.abspath(__file__)), os.getcwd(),
+              "/mount/src/brand-name-matcher", "."]:
+        # Check for single file
+        single = os.path.join(d, "adintel_brands.csv.gz")
+        if os.path.exists(single):
+            return [single]
+        # Check for part files
+        pattern = os.path.join(d, "adintel_brands_part*.csv.gz")
+        parts = sorted(glob.glob(pattern))
+        if parts:
+            return parts
+    return []
+
+
 @st.cache_resource(show_spinner="Loading and indexing reference data...")
 def load_and_build():
     matchers = {}
 
-    ap = find_file(ADINTEL_REF)
-    if ap:
+    # Adintel — load single or multiple part files
+    ad_files = find_adintel_files()
+    if ad_files:
         try:
-            df = pd.read_csv(ap, compression="gzip").fillna("")
+            dfs = []
+            for f in ad_files:
+                dfs.append(pd.read_csv(f, compression="gzip").fillna(""))
+            df = pd.concat(dfs, ignore_index=True)
+            del dfs; gc.collect()
             matchers["ad"] = FastMultiColMatcher(
                 df,
                 search_cols=["Subsidiary", "Brand Core"],
                 display_cols=["Subsidiary", "Brand Core", "Brand Variant"],
                 cat_col="category",
-                expand_col="Brand Variant"  # Expand using Brand Variant starts-with
+                expand_col="Brand Variant"
             )
             del df; gc.collect()
         except Exception as e:
@@ -425,10 +422,7 @@ def main():
         progress = st.progress(0, text="Matching brands...")
 
         for i, brand in enumerate(brands):
-            # Adintel: find ALL matches
             ad_all = matchers["ad"].find_all(brand) if "ad" in matchers else []
-
-            # Pathmatics & Media Radar: single best
             pa_res = matchers["pa"].find_best(brand) if "pa" in matchers else NO_PA
             mr_res = matchers["mr"].find_best(brand) if "mr" in matchers else NO_MR
             pas, mrs = pa_res["score"], mr_res["score"]
@@ -493,7 +487,6 @@ def main():
         total_ad_rows = sum(1 for r in results if r["_ad_score"] >= SUGGEST_THRESHOLD)
 
         st.subheader(f"📊 Results ({n_brands} brands, {total_ad_rows} Adintel rows)")
-
         cols = st.columns(4)
         cols[0].metric("Adintel Brands Matched", f"{am}/{n_brands}")
         cols[1].metric("Adintel Total Rows", f"{total_ad_rows}")
